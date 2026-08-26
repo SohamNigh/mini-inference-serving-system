@@ -1,0 +1,16 @@
+# Go
+go-server/inference-server
+go-server/*.test
+
+# C++
+cpp-engine/build/
+
+# Python
+training/.venv/
+training/data/
+__pycache__/
+*.pyc
+
+# generated weights (produced by training, not hand-edited)
+training/weights.bin
+
