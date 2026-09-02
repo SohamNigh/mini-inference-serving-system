@@ -1,0 +1,28 @@
+syntax = "proto3";
+package inference;
+
+option go_package = "mini-inference-serving-system/go-server/internal/pb;pb";
+
+service InferenceEngine {
+    rpc PredictBatch (PredictBatchRequest) returns (PredictBatchResponse);
+}
+
+message PredictBatchRequest {
+    repeated Image image = 1;
+}
+
+message Image {
+    repeated float pixels = 1;
+    // length must equal the models input_dim 
+}
+
+message Prediction {
+    int32 predicted_class = 1;
+    float confidence = 2; 
+
+}
+
+message PredictBatchResponse {
+    repeated Prediction predictions = 1;
+    // same order/length as the request
+}

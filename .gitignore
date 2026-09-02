@@ -1,5 +1,6 @@
 # Go
 go-server/inference-server
+go-server/main
 go-server/*.test
 
 # C++
