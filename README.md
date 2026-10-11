@@ -33,10 +33,24 @@ The interesting parts are:
 | `training/` | Offline NumPy training and weight export (not the focus) |
 | `scripts/` | Proto code generation |
 
+## Run
+
+```
+# engine (C++), then server (Go)
+./cpp-engine/build/inference_engine weights.bin 127.0.0.1:50051
+cd go-server && go run . -engine 127.0.0.1:50051 -listen :8080
+
+curl -XPOST -H 'Content-Type: application/json' -d '{"pixels":[...784 floats in [0,1]...]}' localhost:8080/predict
+curl localhost:8080/metrics
+```
+
+Flags (`go run . -h`): `-max-batch`, `-max-wait`, `-queue-size`, `-max-in-flight`, `-request-timeout`, `-engine-timeout`, `-shutdown-timeout`, `-drain-delay`. Tests: `cd go-server && go test -race ./...`.
+
 ## Status
 
-- Done: proto contract, C++ kernels/model/gRPC service with unit tests, training/export script, Go batcher (`go-server/internal/batcher`) with race-tested edge cases, and the Go gRPC client (`go-server/internal/engineclient`) verified against the real C++ engine, and the HTTP layer (`go-server/internal/httpapi`: validation, status mapping, deadlines, health/readiness).
-- Next: Prometheus metrics, server wiring and graceful shutdown, end-to-end and load tests.
+- Go server complete and race-tested: batcher, gRPC client, HTTP layer, Prometheus metrics, wiring and graceful shutdown.
+- C++ kernels (matmul, bias, ReLU, softmax) with unit tests; the model loader and gRPC service are being redone.
+- Not done: load test and performance numbers, a real training run.
 
 Full write-up (design, edge cases, trade-offs, interview Q&A): `docs/PROJECT_DEEP_DIVE.md`.
 Build plan: `docs/superpowers/plans/BUILD_PLAN.md`.

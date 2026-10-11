@@ -60,16 +60,15 @@ A batch is sent when it reaches `MaxBatch` **or** when `MaxWait` has passed sinc
 | C++ model loader and forward pass | done, unit-tested |
 | C++ gRPC service (`inference_engine` binary) | done, runs, verified from Go |
 | NumPy training + export script | written, **never run on real MNIST data** (no dataset in `training/data`) |
-| Go batcher (`internal/batcher`) | done, 19 tests, race-tested |
+| Go batcher (`internal/batcher`) | done, 23 tests, race-tested |
 | Go gRPC client (`internal/engineclient`) | done, 11 in-process tests + 2 integration tests against the real C++ engine |
 | Go HTTP layer (`internal/httpapi`) | done, ~40 test cases |
-| Prometheus metrics endpoint | **not built** (hooks exist: `Batcher.Stats()` and the HTTP `Recorder`) |
-| `go-server/main.go` | **still a placeholder**: nothing wires the pieces into a runnable server yet |
-| Graceful shutdown wiring (signal handling) | **not built** (the batcher and HTTP layer support it; `main` doesn't use it) |
-| End-to-end run: HTTP request -> Go -> C++ -> response | **not done** |
+| Go metrics (`internal/metrics`) | done: Prometheus histograms + counters, 8 tests |
+| Go wiring + graceful shutdown (`internal/app`, `main.go`) | done: flags, signals, ordered shutdown, 7 tests |
+| Manual end-to-end smoke run: curl -> Go server -> real C++ engine (random weights) | done once: 200s, 400 on bad input, 503 when the engine was killed, clean SIGTERM shutdown. Not automated. |
 | Load test / any performance numbers | **not done. Don't quote numbers.** |
 
-Honest one-liner for an interview today: *"I've built and tested the batching core, the gRPC client and the HTTP layer in Go, and the C++ engine; the remaining work is the server wiring, metrics, and a load test."*
+Honest one-liner for an interview today: *"The Go server is complete and tested: batching, gRPC client, HTTP layer, metrics and graceful shutdown. I've run it against the C++ engine; what's left is the engine side and a proper load test."*
 
 ### Repo map
 
@@ -82,10 +81,12 @@ cpp-engine/
   generated/                     protobuf/gRPC C++ code (generated, don't read)
   tests/                         Catch2 tests
 go-server/
-  main.go                        placeholder
+  main.go                        flags + signal handling, calls app.Run
   internal/batcher/              queue + dynamic batching + shutdown
   internal/engineclient/         gRPC client to the C++ engine
   internal/httpapi/              HTTP endpoint, validation, status codes
+  internal/metrics/              Prometheus metrics
+  internal/app/                  wiring everything together + graceful shutdown
   internal/pb/                   generated Go protobuf/gRPC code
 training/                        offline NumPy training + weight export
 scripts/gen-proto.sh             regenerates the generated code
@@ -164,6 +165,10 @@ many handler goroutines  --Submit-->  [bounded queue]  -->  1 collector  -->  up
 - **Shutdown flushes instead of waiting.** On close, queued jobs are sent immediately without waiting out `MaxWait`, then in-flight calls are awaited, bounded by the caller's context. It's idempotent.
 - **Failure isolation.** An engine error, wrong-length response or panic fails *that batch only*; later batches work. The panic is caught with `recover` and becomes `ErrEnginePanic`.
 
+### The optional `Observer`
+
+`Config.Observer` is a two-method interface (`ObserveQueueWait`, `ObserveBatch`) that the batcher calls for metrics. It exists so the batcher doesn't import Prometheus. Calls are wrapped in `recover`, so a bug in a metrics hook can never break serving. **Queue wait** is measured from enqueue until the engine call starts (so it includes the batching window and any wait for an engine slot).
+
 ### What `Stats()` reports
 
 `Submitted`, `Rejected` (queue full), `Expired` (dropped before dispatch), `Batches`, `Items` (so average batch size = Items / Batches), `EngineErrors`, `QueueDepth`.
@@ -229,6 +234,45 @@ Liveness and readiness differ on purpose. When draining, readiness fails so the 
 - A `Recorder(status, latency)` callback fires once per request (all outcomes), ready to feed Prometheus.
 
 ---
+
+## 6b. Metrics (`go-server/internal/metrics`)
+
+Served at `GET /metrics` in Prometheus text format. A private registry is used (no global state), so tests and multiple instances can't collide.
+
+| Metric | Type | What it tells you |
+| --- | --- | --- |
+| `inference_http_requests_total{code}` | counter | traffic by status code; 429s, 503s and 504s are the overload story |
+| `inference_http_request_duration_seconds` | histogram | what clients actually experience |
+| `inference_queue_wait_seconds` | histogram | time spent waiting for a batch to form and for an engine slot |
+| `inference_engine_latency_seconds` | histogram | the C++ call alone |
+| `inference_batch_size` | histogram | whether batching works; has **one bucket per size 1..8** because the engine's limit is 8 |
+| `inference_batcher_submitted_total`, `_rejected_total`, `_expired_total`, `_batches_total`, `_items_total`, `_engine_errors_total` | counters | read from `Batcher.Stats()` **at scrape time**, so they're always current |
+| `inference_batcher_queue_depth` | gauge | the leading indicator of saturation |
+
+How to read them: client latency is roughly queue wait + engine latency + a little overhead. If queue wait dominates, the batching window or the engine slots are the bottleneck. If engine latency dominates, it's the C++ side. Average batch size = `items_total / batches_total`.
+
+Label cardinality is kept low on purpose: the only label is the status code. Per-path or per-client labels would blow up the number of time series.
+
+## 6c. Wiring and graceful shutdown (`go-server/internal/app`, `main.go`)
+
+`main.go` parses flags (all have defaults), listens for SIGINT/SIGTERM via `signal.NotifyContext`, and calls `app.Run`. `Run` validates the config, binds the port (failing fast if it's taken), builds the engine client, metrics, batcher and HTTP server, and serves.
+
+**Config checks that catch misconfiguration at startup:** every field must be set; `RequestTimeout` must exceed `MaxWait` (otherwise every request would time out waiting for its batch); `DrainDelay` must be less than `ShutdownTimeout`.
+
+**Shutdown order (this is the part to be able to explain):**
+
+1. **Mark not-ready** (`/readyz` -> 503) and wait `DrainDelay`. The listener stays open, so requests still arriving are served while the load balancer notices. `/healthz` stays 200, otherwise the orchestrator would kill the process mid-drain.
+2. **Stop the HTTP server** (`http.Server.Shutdown`): stop accepting and wait for in-flight requests to finish. In-flight requests are waiting on the batcher, so the batcher and engine must still be alive.
+3. **Shut down the batcher.** HTTP is stopped, so nothing can enqueue anymore. Anything left is flushed immediately, and in-flight engine calls are awaited.
+4. **Close the engine connection.**
+
+If the order were reversed (batcher first), requests that arrive during the drain would get errors instead of answers.
+
+The whole sequence shares one `ShutdownTimeout` budget, created from a *fresh* context. The signal context is already cancelled by then, and using it would abort the shutdown immediately. If the budget runs out (for example, the engine is stuck), it force-closes the remaining connections and `Run` returns an error saying so, rather than hanging forever.
+
+**Tested with a fake engine over real TCP:** end to end request + metrics; 64 concurrent requests, each routed to the right caller, in far fewer batches than requests; engine killed -> 503 within a second; a request mid-flight when shutdown starts still completes with 200 while `/readyz` already shows 503; the shutdown timeout is enforced when the engine hangs; the server fails fast when the port is taken.
+
+**Manual smoke run** against the real C++ binary (random weights, so predictions are meaningless): valid request -> 200; wrong length -> 400; 40 concurrent requests -> all served, with 33 images grouped into 5 engine calls at the time I scraped; engine killed -> 503; SIGTERM -> readiness 503 during the drain, then a clean exit. This was a one-off sanity check, **not a benchmark**.
 
 ## 7. The C++ engine (`cpp-engine`)
 
@@ -314,16 +358,18 @@ The gRPC server handles requests on a thread pool, so several `PredictBatch` cal
 
 ## 10. How it's tested
 
-- **Batcher (19 tests):** a fake engine client that can block, fail, panic or return wrong-sized answers, so each failure is deterministic. Timing is coordinated with channels and a polling `eventually` helper on `Stats()` rather than fixed sleeps. Everything runs with `go test -race`.
-- **gRPC client (11 tests):** a fake gRPC server running in memory (`bufconn`), so the real client code and real protobuf run without a network. Includes a 200-request batcher+client run, and a check that an `INVALID_ARGUMENT` from the server reaches the original caller as `ErrInvalidRequest`.
+- **Batcher (23 tests):** a fake engine client that can block, fail, panic or return wrong-sized answers, so each failure is deterministic. Timing is coordinated with channels and a polling `eventually` helper on `Stats()` rather than fixed sleeps. Everything runs with `go test -race`.
+- **gRPC client (11 unit + 2 integration tests):** a fake gRPC server running in memory (`bufconn`), so the real client code and real protobuf run without a network. Includes a 200-request batcher+client run, and a check that an `INVALID_ARGUMENT` from the server reaches the original caller as `ErrInvalidRequest`.
 - **Integration tests (build tag `integration`):** run the client against the real C++ binary:
   ```
   ENGINE_ADDR=127.0.0.1:50051 go test -tags=integration ./internal/engineclient/
   ```
   They check the split of 20 images into 3 calls and that a wrong-length image comes back as `ErrInvalidRequest`. They need a running engine, so they're skipped in a normal `go test`.
 - **HTTP layer (~40 cases):** table tests for every malformed input (asserting the batcher is never reached), every error-to-status mapping (asserting no internal detail leaks), timeouts, disconnect, panic recovery, readiness, recording, and a saturation test with the real batcher producing a 429.
+- **Metrics (8 tests):** read values back out of the registry; check the batch-size buckets resolve sizes 1..8, that counters are read at scrape time, and that duplicate registration errors instead of panicking.
+- **App (7 tests):** end to end over real TCP with a fake engine, including the graceful-shutdown scenarios in 6c.
 - **C++ (5 Catch2 test cases, 27 assertions):** kernels on small hand-computed matrices, and the model loader on a tiny fixture.
-- **Mutation checks:** I deliberately broke the code (no dispatch-time prune, blocking enqueue, no panic recovery, no body limit, no range check, no trailing-data check, unmapped 429, no 499) and confirmed tests fail. Passing tests only mean something if they can fail.
+- **Mutation checks:** I deliberately broke the code (no dispatch-time prune, blocking enqueue, no panic recovery, no body limit, no range check, no trailing-data check, unmapped 429, no 499, never marking draining, shutting down with the cancelled context, unbounded batcher shutdown). One surviving mutation: removing the forced `srv.Close()` after a shutdown timeout isn't caught, because the test only checks that `Run` returns an error in time and confirmed tests fail. Passing tests only mean something if they can fail.
 
 Run everything:
 ```
@@ -344,7 +390,7 @@ cd cpp-engine/build && ./inference_tests
 3. **One request in a batch times out. What happens to the others?** Only that caller returns early. The engine call keeps going until the latest deadline, so the others still get answers.
 4. **How do you avoid returning a result to the wrong caller?** Each job has its own channel; the engine's ordered response is matched by index *after* checking the length; a 300-goroutine test checks it.
 5. **Engine is down?** The client fails fast with `ErrUnavailable`; the batcher fails that batch immediately; callers get 503 with `Retry-After`. Nothing piles up waiting on a reconnect.
-6. **How do you shut down without dropping requests?** Mark draining (readiness fails), stop accepting, flush queued jobs immediately, wait for in-flight engine calls under a deadline. (The pieces exist; `main` doesn't yet call them in this order.)
+6. **How do you shut down without dropping requests?** Mark draining (readiness fails), stop accepting, flush queued jobs immediately, wait for in-flight engine calls under a deadline. `app.Run` does exactly this, and the order matters: HTTP stops before the batcher so in-flight requests still have a live backend.
 7. **Why 429 vs 503 vs 504?** 429: you're sending too much, back off. 503: temporarily unavailable, retry elsewhere. 504: I accepted it but ran out of time.
 8. **Why is a client disconnect 499, not an error?** It isn't the server's fault, and counting it as an error would pollute alerting.
 9. **Where could there be a data race?** The shared `closed` flag versus sends on the queue (guarded by the lock), the `Stats` counters (atomics), and the model weights (read-only). The race detector runs on all of it.
@@ -353,7 +399,7 @@ cd cpp-engine/build && ./inference_tests
 12. **Why two languages?** Go for concurrent I/O, C++ for control of memory and compute.
 13. **A cross-language bug you found?** The engine silently capped batches at 8 and validates pixel range on its own, constraints that only existed in the C++ code. The Go client now enforces the split, and the HTTP layer validates the same range so the two stay consistent.
 
-**Be upfront about:** no real training run, no end-to-end run yet, no metrics endpoint yet, and no performance numbers.
+**Be upfront about:** no real training run, the end-to-end run was a manual smoke test with random weights (not automated), and there are no performance numbers.
 
 ---
 
@@ -372,10 +418,9 @@ cd cpp-engine/build && ./inference_tests
 
 **Next steps:**
 
-1. Prometheus metrics: batch-size histogram, queue-wait and engine-latency histograms, counters from `Stats()` and the `Recorder`.
-2. `main.go`: config flags, wiring, signal handling, and the shutdown order (draining -> stop HTTP -> `Batcher.Shutdown` -> close client).
-3. End-to-end run against the real engine with real (trained) weights.
-4. Load test with failure injection (kill the engine mid-load) to produce real numbers and real stories.
+1. Finish the engine side. Per the current plan, only the kernels (matmul, ReLU, softmax) stay as finished C++; the model loader and gRPC service are to be redone later.
+2. A load test with failure injection (kill the engine mid-load) to produce real numbers and real stories.
+3. Run against real trained weights.
 
 ---
 

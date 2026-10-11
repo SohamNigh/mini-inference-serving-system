@@ -654,3 +654,116 @@ func TestStatsCountBatchesItemsAndEngineErrors(t *testing.T) {
 		t.Fatalf("unexpected stats: %+v", s)
 	}
 }
+
+// ---- observer hooks (feed metrics without coupling to Prometheus) -----------
+
+type fakeObserver struct {
+	mu    sync.Mutex
+	waits []time.Duration
+	sizes []int
+	lats  []time.Duration
+	errs  []error
+}
+
+func (o *fakeObserver) ObserveQueueWait(d time.Duration) {
+	o.mu.Lock()
+	o.waits = append(o.waits, d)
+	o.mu.Unlock()
+}
+
+func (o *fakeObserver) ObserveBatch(size int, lat time.Duration, err error) {
+	o.mu.Lock()
+	o.sizes = append(o.sizes, size)
+	o.lats = append(o.lats, lat)
+	o.errs = append(o.errs, err)
+	o.mu.Unlock()
+}
+
+func (o *fakeObserver) snapshot() (waits []time.Duration, sizes []int, lats []time.Duration, errs []error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append(waits, o.waits...), append(sizes, o.sizes...), append(lats, o.lats...), append(errs, o.errs...)
+}
+
+func TestObserverSeesBatchSizeEngineLatencyAndPerJobQueueWait(t *testing.T) {
+	obs := &fakeObserver{}
+	client := &fakeClient{fn: func(ctx context.Context, images [][]float32) ([]Prediction, error) {
+		time.Sleep(20 * time.Millisecond)
+		return classFromFirstPixel(ctx, images)
+	}}
+	cfg := testConfig()
+	cfg.MaxBatch = 2
+	cfg.MaxWait = time.Hour
+	cfg.Observer = obs
+	b := newBatcher(t, client, cfg)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); _, _ = submit(b, 1) }()
+	}
+	wg.Wait()
+
+	eventually(t, "observer notified", func() bool { _, s, _, _ := obs.snapshot(); return len(s) == 1 })
+	waits, sizes, lats, errs := obs.snapshot()
+	if sizes[0] != 2 || errs[0] != nil {
+		t.Fatalf("batch observation: size=%d err=%v", sizes[0], errs[0])
+	}
+	if lats[0] < 20*time.Millisecond {
+		t.Fatalf("engine latency %v shorter than the engine's own sleep", lats[0])
+	}
+	if len(waits) != 2 {
+		t.Fatalf("want one queue-wait observation per dispatched job, got %d", len(waits))
+	}
+	for _, w := range waits {
+		if w < 0 {
+			t.Fatalf("negative queue wait %v", w)
+		}
+	}
+}
+
+func TestObserverSeesFailedBatchWithItsError(t *testing.T) {
+	obs := &fakeObserver{}
+	wantErr := errors.New("down")
+	client := &fakeClient{fn: func(context.Context, [][]float32) ([]Prediction, error) { return nil, wantErr }}
+	cfg := testConfig()
+	cfg.Observer = obs
+	b := newBatcher(t, client, cfg)
+
+	_, _ = submit(b, 1)
+	eventually(t, "observer notified", func() bool { _, s, _, _ := obs.snapshot(); return len(s) == 1 })
+	if _, _, _, errs := obs.snapshot(); !errors.Is(errs[0], wantErr) {
+		t.Fatalf("observer got err %v, want %v", errs[0], wantErr)
+	}
+}
+
+func TestQueueWaitMeasuresTimeSpentWaitingForBatchWindow(t *testing.T) {
+	obs := &fakeObserver{}
+	cfg := testConfig()
+	cfg.MaxBatch = 100
+	cfg.MaxWait = 40 * time.Millisecond
+	cfg.Observer = obs
+	b := newBatcher(t, &fakeClient{}, cfg)
+
+	if _, err := submit(b, 1); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "observer notified", func() bool { w, _, _, _ := obs.snapshot(); return len(w) == 1 })
+	if w, _, _, _ := obs.snapshot(); w[0] < 35*time.Millisecond {
+		t.Fatalf("queue wait %v, expected about the 40ms batching window", w[0])
+	}
+}
+
+func TestPanickingObserverDoesNotBreakServing(t *testing.T) {
+	cfg := testConfig()
+	cfg.Observer = panicObserver{}
+	b := newBatcher(t, &fakeClient{}, cfg)
+	if p, err := submit(b, 3); err != nil || p.Class != 3 {
+		t.Fatalf("a broken metrics hook must not affect requests: %+v %v", p, err)
+	}
+}
+
+type panicObserver struct{}
+
+func (panicObserver) ObserveQueueWait(time.Duration)         { panic("metrics bug") }
+func (panicObserver) ObserveBatch(int, time.Duration, error) { panic("metrics bug") }

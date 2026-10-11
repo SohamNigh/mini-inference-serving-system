@@ -36,12 +36,24 @@ type EngineClient interface {
 	PredictBatch(ctx context.Context, images [][]float32) ([]Prediction, error)
 }
 
+// Observer receives timing signals for metrics. It is optional and must be
+// cheap and non-blocking. A panicking Observer is contained: it never affects
+// requests.
+type Observer interface {
+	// ObserveQueueWait is called once per job sent to the engine, with the time
+	// from enqueue until its batch's engine call began.
+	ObserveQueueWait(d time.Duration)
+	// ObserveBatch is called once per engine call. err is nil on success.
+	ObserveBatch(size int, engineLatency time.Duration, err error)
+}
+
 type Config struct {
 	MaxBatch      int           // flush when this many requests are collected
 	MaxWait       time.Duration // flush this long after the first request of a batch arrives
 	QueueSize     int           // bounded queue; a full queue rejects with ErrQueueFull
 	EngineTimeout time.Duration // upper bound on a single engine call
 	MaxInFlight   int           // concurrent engine calls
+	Observer      Observer      // optional metrics hook
 }
 
 // Stats is a point-in-time snapshot of counters, intended for metrics export.
@@ -57,6 +69,7 @@ type Stats struct {
 
 type job struct {
 	ctx      context.Context
+	enqueued time.Time
 	pixels   []float32 // owned by the caller; must not be mutated until Submit returns a result
 	resultCh chan result
 }
@@ -112,7 +125,7 @@ func (b *Batcher) Submit(ctx context.Context, pixels []float32) (Prediction, err
 	if err := ctx.Err(); err != nil {
 		return Prediction{}, err
 	}
-	j := &job{ctx: ctx, pixels: pixels, resultCh: make(chan result, 1)}
+	j := &job{ctx: ctx, pixels: pixels, resultCh: make(chan result, 1), enqueued: time.Now()}
 
 	// Holding the read lock while sending guarantees Shutdown cannot close the
 	// queue underneath us (send on closed channel would panic).
@@ -246,10 +259,15 @@ func (b *Batcher) dispatch(batch []*job) {
 
 	b.batches.Add(1)
 	b.items.Add(int64(len(live)))
+	callStart := time.Now()
+	for _, j := range live {
+		b.observe(func(o Observer) { o.ObserveQueueWait(callStart.Sub(j.enqueued)) })
+	}
 	preds, err := b.call(ctx, images)
 	if err == nil && len(preds) != len(live) {
 		err = fmt.Errorf("%w: sent %d, got %d", ErrBadResponse, len(live), len(preds))
 	}
+	b.observe(func(o Observer) { o.ObserveBatch(len(live), time.Since(callStart), err) })
 	if err != nil {
 		b.engineErrors.Add(1)
 		for _, j := range live {
@@ -294,4 +312,14 @@ func (b *Batcher) call(ctx context.Context, images [][]float32) (preds []Predict
 		}
 	}()
 	return b.client.PredictBatch(ctx, images)
+}
+
+// observe calls fn with the configured Observer, containing any panic so a
+// metrics bug cannot take down a dispatch goroutine (and with it the process).
+func (b *Batcher) observe(fn func(Observer)) {
+	if b.cfg.Observer == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	fn(b.cfg.Observer)
 }
