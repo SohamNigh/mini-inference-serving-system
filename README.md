@@ -35,8 +35,8 @@ The interesting parts are:
 
 ## Status
 
-- Done: proto contract, C++ kernels/model/gRPC service with unit tests, training/export script, Go batcher (`go-server/internal/batcher`) with race-tested edge cases.
-- Next: Go gRPC client and HTTP handler, Prometheus metrics, end-to-end and load tests.
+- Done: proto contract, C++ kernels/model/gRPC service with unit tests, training/export script, Go batcher (`go-server/internal/batcher`) with race-tested edge cases, and the Go gRPC client (`go-server/internal/engineclient`) verified against the real C++ engine, and the HTTP layer (`go-server/internal/httpapi`: validation, status mapping, deadlines, health/readiness).
+- Next: Prometheus metrics, server wiring and graceful shutdown, end-to-end and load tests.
 
 Full write-up (design, edge cases, trade-offs, interview Q&A): `docs/PROJECT_DEEP_DIVE.md`.
 Build plan: `docs/superpowers/plans/BUILD_PLAN.md`.
